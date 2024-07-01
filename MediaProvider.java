@@ -724,7 +724,10 @@ public class MediaProvider extends ContentProvider {
     private void ensureDefaultFolders(String volumeName, DatabaseHelper helper, SQLiteDatabase db) {
         try {
             final File path = getVolumePath(volumeName);
-            final StorageVolume vol = mStorageManager.getStorageVolume(path);
+	    //HCL MOD -S
+            //final StorageVolume vol = mStorageManager.getStorageVolume(path);
+	      final StorageVolume vol = mStorageManager.getPrimaryVolume();
+	    //HCL MOD -E
             final String key;
             if (VolumeInfo.ID_EMULATED_INTERNAL.equals(vol.getId())) {
                 key = "created_default_folders";
@@ -1510,8 +1513,16 @@ public class MediaProvider extends ContentProvider {
         values.remove(ImageColumns.PRIMARY_DIRECTORY);
         values.remove(ImageColumns.SECONDARY_DIRECTORY);
 
-        final String data = values.getAsString(MediaColumns.DATA);
+        String data = values.getAsString(MediaColumns.DATA);
         if (TextUtils.isEmpty(data)) return;
+
+        try {
+            data = new File(data).getCanonicalPath();
+            values.put(MediaColumns.DATA, data);
+        } catch (IOException e) {
+            throw new IllegalArgumentException(
+                    String.format(Locale.ROOT, "Invalid file path:%s in request.", data));
+        }
 
         final File file = new File(data);
         final File fileLower = new File(data.toLowerCase());
@@ -2180,7 +2191,16 @@ public class MediaProvider extends ContentProvider {
             final File actual = new File(values.getAsString(MediaColumns.DATA))
                     .getCanonicalFile();
             if (!FileUtils.contains(allowed, actual)) {
-                throw new VolumeArgumentException(actual, allowed);
+                //BUG-1627 - HCL - ADD -S
+                if (!actual.getAbsolutePath().contains(Environment.getHddDirectory().toString()) &&
+                    !actual.getAbsolutePath().contains(Environment.getRamdiskDirectory().toString()) &&
+                    !actual.getAbsolutePath().contains(Environment.getSgwHddDirectory().toString()) &&
+                    !actual.getAbsolutePath().contains(Environment.getSgwRamdiskDirectory().toString())) {
+                    throw new VolumeArgumentException(actual, allowed);
+                } else {
+                    Log.d(TAG, "allowed hdd or ramdisk path");
+                }
+                //BUG-1627 - HCL - ADD -E
             }
         } catch (IOException e) {
             throw new IllegalArgumentException(e);
@@ -2294,15 +2314,24 @@ public class MediaProvider extends ContentProvider {
 
     private static @Nullable String extractRelativePath(@Nullable String data) {
         if (data == null) return null;
-        final Matcher matcher = PATTERN_RELATIVE_PATH.matcher(data);
+
+        final String path;
+        try {
+            path = getCanonicalPath(data);
+        } catch (IOException e) {
+            Log.d(TAG, "Unable to get canonical path from invalid data path: " + data, e);
+            return null;
+        }
+
+        final Matcher matcher = PATTERN_RELATIVE_PATH.matcher(path);
         if (matcher.find()) {
-            final int lastSlash = data.lastIndexOf('/');
+            final int lastSlash = path.lastIndexOf('/');
             if (lastSlash == -1 || lastSlash < matcher.end()) {
                 // This is a file in the top-level directory, so relative path is "/"
                 // which is different than null, which means unknown path
                 return "/";
             } else {
-                return data.substring(matcher.end(), lastSlash + 1);
+                return path.substring(matcher.end(), lastSlash + 1);
             }
         } else {
             return null;
@@ -4154,30 +4183,45 @@ public class MediaProvider extends ContentProvider {
     @Override
     public Bundle call(String method, String arg, Bundle extras) {
         switch (method) {
-            case MediaStore.SCAN_FILE_CALL:
+            case MediaStore.SCAN_FILE_CALL: {
+                final LocalCallingIdentity token = clearLocalCallingIdentity();
+                final CallingIdentity providerToken = clearCallingIdentity();
+
+                final Uri uri;
+                try {
+                    final Uri fileUri = extras.getParcelable(Intent.EXTRA_STREAM);
+                    File file;
+                    try {
+                        file = getCanonicalFile(fileUri.getPath());
+                    } catch (IOException e) {
+                        file = null;
+                    }
+
+                    uri = file != null ? MediaScanner.instance(getContext()).scanFile(file) : null;
+                } finally {
+                    restoreCallingIdentity(providerToken);
+                    restoreLocalCallingIdentity(token);
+                }
+
+                final Bundle res = new Bundle();
+                res.putParcelable(Intent.EXTRA_STREAM, uri);
+                return res;
+            }
             case MediaStore.SCAN_VOLUME_CALL: {
                 final LocalCallingIdentity token = clearLocalCallingIdentity();
                 final CallingIdentity providerToken = clearCallingIdentity();
+
                 try {
                     final Uri uri = extras.getParcelable(Intent.EXTRA_STREAM);
                     final File file = new File(uri.getPath());
-                    final Bundle res = new Bundle();
-                    switch (method) {
-                        case MediaStore.SCAN_FILE_CALL:
-                            res.putParcelable(Intent.EXTRA_STREAM,
-                                    MediaScanner.instance(getContext()).scanFile(file));
-                            break;
-                        case MediaStore.SCAN_VOLUME_CALL:
-                            MediaService.onScanVolume(getContext(), Uri.fromFile(file));
-                            break;
-                    }
-                    return res;
+                    MediaService.onScanVolume(getContext(), Uri.fromFile(file));
                 } catch (IOException e) {
                     throw new RuntimeException(e);
                 } finally {
                     restoreCallingIdentity(providerToken);
                     restoreLocalCallingIdentity(token);
                 }
+                return Bundle.EMPTY;
             }
             case MediaStore.UNHIDE_CALL: {
                 throw new UnsupportedOperationException();
@@ -6607,4 +6651,31 @@ public class MediaProvider extends ContentProvider {
         }
         return s.toString();
     }
+
+    /**
+     * Returns the canonical {@link File} for the provided abstract pathname.
+     *
+     * @return The canonical pathname string denoting the same file or directory as this abstract
+     *         pathname
+     * @see File#getCanonicalFile()
+     */
+    @NonNull
+    public static File getCanonicalFile(@NonNull String path) throws IOException {
+        Objects.requireNonNull(path);
+        return new File(path).getCanonicalFile();
+    }
+
+    /**
+     * Returns the canonical pathname string of the provided abstract pathname.
+     *
+     * @return The canonical pathname string denoting the same file or directory as this abstract
+     *         pathname.
+     * @see File#getCanonicalPath()
+     */
+    @NonNull
+    public static String getCanonicalPath(@NonNull String path) throws IOException {
+        Objects.requireNonNull(path);
+        return new File(path).getCanonicalPath();
+    }
+
 }
